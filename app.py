@@ -4,10 +4,14 @@ import threading
 import time
 from datetime import datetime
 from flask import Flask, jsonify, render_template, request
-import serial
 
-SERIAL_PORT = "COM3"      # غيّرها إلى منفذ Arduino Uno لديك
-BAUD_RATE = 115200
+try:
+    import serial  # type: ignore
+except ImportError:
+    serial = None
+
+SERIAL_PORT = os.environ.get("SERIAL_PORT", "COM3")
+BAUD_RATE = int(os.environ.get("BAUD_RATE", "115200"))
 SCHEDULE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "med_schedule.json")
 
 app = Flask(__name__)
@@ -22,16 +26,14 @@ latest_distance = None
 obstacle_detected = False
 med_alert_state = False
 active_med_name = None
-serial_status = "disconnected"
-
-# قائمة المواعيد: [{"id": "1700000000", "time": "08:00", "name": "دواء الضغط", "enabled": True, "last_triggered_minute": ""}]
+serial_status = "cloud_only" if serial is None else "disconnected"
 med_schedules = []
 
 
 def add_log(direction: str, message: str, echo_to_console: bool = True):
     entry = {
         "time": datetime.now().strftime("%H:%M:%S"),
-        "direction": direction,  # "RX" من الأردوينو، "TX" إلى الأردوينو، "SYS" نظام
+        "direction": direction,
         "message": message,
     }
     with state_lock:
@@ -101,6 +103,10 @@ def parse_arduino_line(line: str):
 
 def serial_reader_loop():
     global ser, serial_status
+    if serial is None:
+        add_log("SYS", "وضع السحابة نشط (لا يوجد منفذ Serial على الخادم).")
+        return
+
     while True:
         if ser is None or not ser.is_open:
             try:
@@ -111,11 +117,11 @@ def serial_reader_loop():
                 with state_lock:
                     serial_status = "connected"
                 add_log("SYS", f"تم الاتصال بالمنفذ {SERIAL_PORT} بسرعة {BAUD_RATE}")
-            except Exception as e:
+            except Exception:
                 with state_lock:
                     serial_status = "disconnected"
                 ser = None
-                time.sleep(2.0)
+                time.sleep(3.0)
                 continue
 
         try:
@@ -133,7 +139,7 @@ def serial_reader_loop():
             except Exception:
                 pass
             ser = None
-            time.sleep(1.5)
+            time.sleep(2.0)
 
 
 def send_serial_command(cmd: str, med_name: str | None = None) -> tuple[bool, str]:
@@ -142,36 +148,40 @@ def send_serial_command(cmd: str, med_name: str | None = None) -> tuple[bool, st
     if not clean_cmd:
         return False, "الأمر فارغ"
 
+    is_med_on = clean_cmd in ("MED_ALERT:1", "MED_ON", "ALERT:TRUE", "1")
+    is_stop = clean_cmd in ("STOP_ALL", "STOP", "CLEAR_ALERT", "MED_ALERT:0", "MED_OFF", "ALERT:FALSE", "0")
+
     with serial_lock:
-        if ser is None or not ser.is_open:
-            return False, "المنفذ التسلسلي غير متصل"
-        try:
-            ser.write((clean_cmd + "\n").encode("utf-8"))
-            ser.flush()
-            add_log("TX", clean_cmd)
+        serial_sent = False
+        if ser is not None and ser.is_open:
+            try:
+                ser.write((clean_cmd + "\n").encode("utf-8"))
+                ser.flush()
+                serial_sent = True
+            except Exception as e:
+                add_log("SYS", f"تعذر الإرسال عبر السيريال: {e}")
 
-            with state_lock:
-                if clean_cmd in ("MED_ALERT:1", "MED_ON", "ALERT:TRUE", "1"):
-                    med_alert_state = True
-                    active_med_name = med_name or active_med_name or "موعد دواء"
-                elif clean_cmd in ("STOP_ALL", "STOP", "CLEAR_ALERT", "MED_ALERT:0", "MED_OFF", "ALERT:FALSE", "0"):
-                    med_alert_state = False
-                    active_med_name = None
-                    obstacle_detected = False
-                    if last_event and last_event.get("event") == "SOS":
-                        last_event = {
-                            "time": datetime.now().strftime("%H:%M:%S"),
-                            "event": "ALL_STOPPED",
-                            "raw": {"event": "ALL_STOPPED"},
-                        }
+        add_log("TX", clean_cmd + ("" if serial_sent else " [CLOUD/NO-SERIAL]"))
 
-            return True, f"تم إرسال الأمر: {clean_cmd}"
-        except Exception as e:
-            return False, f"فشل الإرسال: {e}"
+        with state_lock:
+            if is_med_on:
+                med_alert_state = True
+                active_med_name = med_name or active_med_name or "موعد دواء"
+            elif is_stop:
+                med_alert_state = False
+                active_med_name = None
+                obstacle_detected = False
+                if last_event and last_event.get("event") == "SOS":
+                    last_event = {
+                        "time": datetime.now().strftime("%H:%M:%S"),
+                        "event": "ALL_STOPPED",
+                        "raw": {"event": "ALL_STOPPED"},
+                    }
+
+    return True, f"تم تنفيذ الأمر: {clean_cmd}"
 
 
 def scheduler_loop():
-    """مراقبة مواعيد الأدوية وإرسال التنبيه تلقائياً عند حلول الوقت المحدد."""
     while True:
         now_dt = datetime.now()
         current_hm = now_dt.strftime("%H:%M")
@@ -190,10 +200,16 @@ def scheduler_loop():
 
         if due_item:
             med_label = f"{due_item.get('name', 'دواء')} ({due_item.get('time')})"
-            add_log("SYS", f"حان موعد الدواء: {med_label} — جاري إرسال MED_ALERT:1")
+            add_log("SYS", f"حان موعد الدواء: {med_label}")
             send_serial_command("MED_ALERT:1", med_name=med_label)
 
         time.sleep(1.0)
+
+
+# تهيئة التطبيق والخيوط الخلفية عند الاستيراد بواسطة Gunicorn أو التشغيل المباشر
+load_schedules()
+threading.Thread(target=serial_reader_loop, daemon=True).start()
+threading.Thread(target=scheduler_loop, daemon=True).start()
 
 
 @app.route("/")
@@ -228,7 +244,6 @@ def manage_schedules():
     med_time = str(data.get("time", "")).strip()
     med_name = str(data.get("name", "")).strip()
 
-    # التحقق من صيغة الوقت HH:MM
     try:
         parsed = datetime.strptime(med_time, "%H:%M")
         normalized_time = parsed.strftime("%H:%M")
@@ -291,7 +306,4 @@ def post_command():
 
 
 if __name__ == "__main__":
-    load_schedules()
-    threading.Thread(target=serial_reader_loop, daemon=True).start()
-    threading.Thread(target=scheduler_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False)
